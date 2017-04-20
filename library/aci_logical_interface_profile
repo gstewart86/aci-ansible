@@ -1,0 +1,479 @@
+#!/usr/bin/python
+
+# Copyright 2015 Jason Edelman <jason@networktocode.com>
+# Network to Code, LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+
+module: aci_logical_interface_profile
+short_description: Manage tenant logical interface profiles within an external routed network in an ACI fabric
+description:
+    - Offers ability to manage tenant logical interface profiles within an external routed network
+author: Garrett Stewart (garrett.tstewart@gmail.com)
+requirements:
+    - ACI Fabric 1.0(3f)+
+    - Cobra SDK
+options:
+    name:
+        description:
+            - Name of logical interface profile
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    descr:
+        description:
+            - description of logical interface profile
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    logical_node_profile:
+        description:
+            - description of logical interface profile
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    external_routed_network:
+        description:
+            - description of logical interface profile
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    tenant:
+        description:
+            - description of logical interface profile
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    vrf:
+        description:
+            - description of logical interface profile
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    svi:
+        description:
+            - list of SVIs that belong to this logical interface profile
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    ospf:
+        description:
+            - list of OSPF interface profiles that belong to this logical interface profile
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    state:
+        description:
+            - Desired state of the logical interface profile
+        required: false
+        default: present
+        choices: ['present','absent']
+        aliases: []
+    host:
+        description:
+            - IP Address or hostname of APIC resolvable by Ansible control host
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    username:
+        description:
+            - Username used to login to the switch
+        required: true
+        default: 'admin'
+        choices: []
+        aliases: []
+    password:
+        description:
+            - Password used to login to the switch
+        required: true
+        default: 'C1sco12345'
+        choices: []
+        aliases: []
+    protocol:
+        description:
+            - Dictates connection protocol
+        required: false
+        default: https
+        choices: ['http', 'https']
+        aliases: []
+'''
+
+EXAMPLES = '''
+# ensure logical interface profile exists
+- name: ensure logical interface profile exists
+  aci_external_network_instance_prfile:
+    name: "{{ logintprof }}"
+    descr: "logical interface profile by ansible"
+    tenant: "{{ tenant }}"
+    vrf: "{{ vrf }}"
+    logical_node_profile: "{{ logintprof }}"
+    external_routed_network: "{{ l3out }}"
+    state: "{{ state }}"
+    host: "{{ inventory_hostname }}"
+    username: "{{ user }}"
+    password: "{{ passwd }}"
+    SVI:
+      - ip : '0.0.0.0'
+        vlan : '2555'
+        sideAip: '10.161.253.169/29'
+        sideBip: '10.161.253.170/29'
+        port_type : 'ext-svi'
+        mtu : 'inherit'
+        mode: 'native(802.1p), regular (trunk), or untagged'
+        path: 'topology/pod-1/protpaths-204-403/pathep-[l2_dc_fw_data_vpc_int_pol_grp]'
+    OSPF:
+      - auth_key : ''
+        auth_key_id : 'test-name2'
+        auth_type : 'md5'
+        ospf_int_pol : 'ospf_75sec_dead_interval'
+
+# ensure logical interface profile does not exist on system
+- aci_external_routed_network:
+    tenant=ACILab
+    name=ACI-test-l3out
+    state=absent
+    host={{ inventory_hostname }}
+    username={{ user }}
+    password={{ pass }}
+
+'''
+
+import socket
+import requests
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    import cobra.model.ospf
+    import cobra.model.l3ext
+    from cobra.model.fv import Tenant
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+requests.packages.urllib3.disable_warnings()
+
+def merge_dicts(*dict_args):
+    '''
+    Given any number of dicts, shallow copy and merge into a new dict,
+    precedence goes to key value pairs in latter dicts.
+    '''
+    result = {}
+    for dictionary in dict_args:
+        result.update(dictionary)
+    return result
+
+def get_existing_params(md, logintprof, classes=None):
+    existing = {}
+    # existing['nodes'] = []
+    propFilter = 'and(wcard(l3extLIfP.dn, "%s"))' % logintprof
+    list = md.lookupByClass(
+        "l3extLIfP",
+        propFilter = propFilter,
+        queryTarget = "subtree",
+        classFilter = classes
+    )
+    for obj in list:
+        # logical interface profile config
+        if hasattr(obj, 'name'):
+            existing['name'] = obj.name
+        if hasattr(obj, 'descr'):
+            existing['descr'] = obj.descr
+        if hasattr(obj, 'targetDscp'):
+            existing['targetDscp'] = obj.targetDscp
+        # node config
+        if hasattr(obj, 'rtrId'):
+            existing['nodes'].append({'rtrid' : obj.rtrId, 'tDn' : obj.tDn})
+            #existing['tDn'] = obj.rtrId
+    return existing
+
+def get_tenant_objects(moDir, uri, name, parent, children):
+    # Returns objects relevant to this change.
+    # objects (str): a comma-separated string of objects used to limit the query
+    dnq = DnQuery(uri.format(parent, name))
+    dnq.queryTarget = 'subtree'
+    dnq.classFilter = children
+    dnq.subtree = 'full'
+    # Submit query - default ordered by how the 'children' CSS was passed
+    objs = moDir.query(dnq)
+    return objs
+
+def get_attributes(keymap, *obj_list):
+    # Take in a dictionary/list of empty keys and list of objects, list of dicts
+    resource = {}
+    resource_lists = []
+    if dict_args:
+        for item in obj_list:
+            for key in keymap.keys():
+                if hasattr(item, key):
+                    resource[mine] = value
+            resource_lists.append(resource)
+        return resource_lists
+
+def get_l3out(md, tenant, name):
+    existing = {}
+    # Used the object browser at <apicaddr>.visore to find the proper object and output its
+    # last query. That's how i found the string to use as the propFilter argument.
+    # i.e.     /api/node/class/l3extOut.xml?query-target-filter=and(wcard(l3extOut.dn,"test-tenant"))
+    # Build the argument
+    propFilter = 'and(wcard(l3extOut.dn, "%s"))' % name
+    # Returns as some sort of dict. If there are 0 results, will still be an empty dict
+    # So we'll do an if statement to return either a specific object or a NoneType
+    list = md.lookupByClass("l3extOut", propFilter=propFilter)
+    for obj in list:
+        existing['name'] = obj.name
+        # TODO: properly get the tenant string, right now its got some MO garbage on it
+        existing['descr'] = obj.descr
+        existing['targetDscp'] = obj.targetDscp
+        existing['enforceRtctrl'] = obj.enforceRtctrl
+        tenant_obj = md.lookupByDn(str(obj.parentDn))
+        existing['tenant'] = tenant_obj.name
+    return existing
+
+def get_logdnodeprof_ospf(moDir, tenant, l3out):
+    existing={}
+    uri = 'uni/tn-{0}/out-{1}'
+    dnq = DnQuery(uri.format(tenant, l3out))
+    dnq.queryTarget = 'children'
+    # Get OSPF data from the child object of the l3out
+    dnq.classFilter = 'ospfExtP'
+    ospfList = moDir.query(dnq)
+    for obj in ospfList:
+        existing['areaCost'] = obj.areaCost
+        existing['areaCtrl'] = obj.areaCtrl
+        existing['areaId'] = obj.areaId
+        existing['areaType'] = obj.areaType
+    return existing
+
+def get_l3out_vrf(moDir, tenant, l3out):
+    existing={}
+    uri = 'uni/tn-{0}/out-{1}'
+    dnq = DnQuery(uri.format(tenant, l3out))
+    dnq.queryTarget = 'children'
+    dnq.classFilter = 'l3extRsEctx'
+    ctxList = moDir.query(dnq)
+    for obj in ctxList:
+        existing['vrf'] = obj.tnFvCtxName
+    return existing
+
+def get_tenant_mo(moDir, tenant):
+    existing={}
+    uri = 'uni/tn-{0}/'
+    dnq = DnQuery(uri.format(tenant))
+    dnq.queryTarget = 'self'
+    dnq.classFilter = 'fvTenant'
+    obj = moDir.query(dnq)
+    return obj
+
+def main():
+
+    # Declare some variables
+    key_map = dict(
+    name='name',
+    tenant='tenant',
+    descr='descr',
+    vrf='tnFvCtxName',
+    extRtdDom='l3extRsL3DomAtt'
+    )
+
+    key_map = dict(
+        l3extOut = ['name', 'tenant', 'descr', 'targetDscp', 'enforceRtctrl'],
+        ospfExtP = ['areaId', 'areaType', 'areaCost', 'areaCtrl'],
+        l3extRsEctx = ['vrf'],
+        l3extRsL3DomAtt = [],
+        fvTenant = ['name']
+
+    )
+
+    classes='l3extOut,' \
+            'ospfExtP,' \
+            'l3extRsEctx,' \
+            'l3extRsL3DomAtt,' \
+            'fvTenant'
+
+
+    config_args = {}
+    vrf_args = {}
+    ospf_args = {}
+    l3out_args = {}
+    changed = False
+    results = {}
+    xmldoc = ''
+    new_mo = None
+
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            # Logical Interface Profile Settings
+            tenant=dict(type='str', required=True),
+            name=dict(type='str', required=True),
+            vrf=dict(type='str'),
+            descr=dict(type='str'),
+            targetDscp=dict(type='str', default='unspecified'),
+            # OSPF Settings
+            # APIC Connection Settings
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    # Get all parameters from Ansible
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+    state = module.params['state'].lower()
+    tenant = module.params['tenant']
+    descr = module.params['descr']
+    name = module.params['name']
+    vrf = module.params['vrf']
+    targetDscp = module.params['targetDscp']
+
+    # Passed the assigned values into a dict for ease-of-use
+    args = dict(tenant=tenant,
+        name=name,
+        descr=descr,
+        vrf=vrf)
+
+    # This part looks to strip out empty arguments?
+    proposed = dict((k, v) for k, v in args.iteritems() if v is not None)
+
+    # Set access data for the APIC
+    apic = '{0}://{1}/'.format(protocol, host)
+    session = LoginSession(apic, username, password)
+    md = MoDirectory(session)
+    md.login()
+
+    # Set the logintprof as the URI Dn and get relevant objects
+    uri = 'uni/tn-{0}'
+    summary = get_tenant_objects(md, uri, name, tenant, classes)
+
+    # Get existing data from APIC, handle the error if "existing" returns a NoneType instead of dict
+    existing = get_existing_params(md, logintprof)
+    #existing_ospf = get_l3out_ospf(md, tenant, name)
+    #existing_svi = get_l3out_vrf(md, tenant, name)
+    # Then put them all together for comparison
+    summary = merge_dicts(existing, existing_ospf, existing_vrf)
+
+    # ---------------- compare data and params ------------------------------
+    # This part looks for a difference between the arguments that were passed and those that currently exist
+    # Specifically, this phrase says "what does 'proposed' have that 'existing' doesnt?
+    # returns 'delta', a list of things that proposed has that existing doesn't have.
+    # This gives you a list of things that need changin'
+    delta = dict(set(proposed.iteritems()).difference(summary.iteritems()))
+
+    # Logic for defining how to create the new object. First check if we even said we want it there
+    # with 'present' then check if there are any differences or the config doesn't exist yet
+    if state == 'present':
+        if delta or not summary:
+
+            # Ensure that a proposed value gets configured somehow, whether
+            # It is using a proposed value or an existing value
+            # ignore the fact that its using proposed in the 'for' loop and 'delta' inside -  should be the same
+            for key, value in proposed.iteritems():
+                config_value = delta.get(key, existing.get(key, None))
+                if config_value:
+                    config_args[key] = config_value
+
+            # Remove 'Tenant' Value? why?
+            # You have to pass the name argument alone, outside of config_args.
+            # So we remove that piece and pass it directly.
+            #
+            # Also, we have to pop and return any configuration that will be created
+            # By a different object than the l3out
+            if 'tenant' in config_args.keys():
+                config_args.pop('tenant')
+
+            if 'name' in config_args.keys():
+                config_args.pop('name')
+
+            # Pop and return OSPF params
+            ospf_params={}
+            for key in config_args:
+                if key.startswith('area'):
+                    ospf_params[key] = config_args[key]
+            for key in ospf_params:
+                if config_args[key]:
+                    config_args.pop(key)
+
+            # Pop and return VRF params
+            try:
+                vrf = config_args.pop('vrf')
+            except KeyError:
+                pass
+
+            # -------------------Build the managed objects------------------
+
+            # Build L3out Mo
+            tenant_mo = get_tenant_mo(md, tenant)[0]
+            new_mo = cobra.model.l3ext.Out(tenant_mo, name=name, **config_args)
+
+            # Check for necessary vrf/context configuration
+            # TODO: Test it with an actual VRF
+            if vrf:
+              l3extRsEctx = cobra.model.l3ext.RsEctx(new_mo, tnFvCtxName = vrf)
+
+            # Check for necessary OSPF configuration, create the object if necessary
+            if ospf_params:
+                ospfExtP = cobra.model.ospf.ExtP(new_mo, **ospf_params)
+
+
+
+    elif state == 'absent':
+        if existing:
+            new_mo = cobra.model.l3ext.Out(existing['l3out'], tenant)
+            new_mo.delete()
+
+    if new_mo:
+        xmldoc = toXMLStr(new_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            tenantCfg = ConfigRequest()
+            tenantCfg.addMo(new_mo)
+            md.commit(tenantCfg)
+            results['new'] = get_l3out(md, tenant, name)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+main()

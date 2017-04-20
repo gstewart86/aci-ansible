@@ -1,0 +1,139 @@
+#!/usr/bin/python
+
+import socket
+# disable insecure requests warnings in requests
+import requests
+from re import compile
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    from cobra.model.fabric import HIfPol
+    from cobra.model.pol import Uni
+    from cobra.model.infra import Infra
+    from cobra.model.lldp import IfPol
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+KEY_MAP = {
+    'name': 'name',
+    'adminRxSt':'adminRxSt',
+    'adminTxSt':'adminTxSt',
+    'descr':'descr'
+}
+
+
+def get_attributes(keymap, mo):
+    resource = {}
+    if mo:
+        for mine, cobra in keymap.iteritems():
+            value = getattr(mo, cobra)
+            if value:
+                resource[mine] = value
+    return resource
+
+
+def get_existing(moDir, name):
+    uri = 'uni/infra/lldpIfP-{}'
+    mo = moDir.lookupByDn(uri.format(name))
+    return get_attributes(KEY_MAP,mo)
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            adminRxSt=dict(choices=['enabled', 'disabled'], default='enabled'),
+            adminTxSt=dict(choices=['enabled', 'disabled'], default='enabled'),
+            descr=dict(type='str'),
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    rx_state = module.params['adminRxSt']
+    tx_state = module.params['adminTxSt']
+    descr = module.params['descr']
+    apic = '{0}://{1}/'.format(protocol, host)
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+    polUni = Uni('')
+    infraInfra = Infra(polUni)
+    existing = get_existing(moDir, name)
+    args = dict(name=name, descr=descr, adminRxSt=rx_state, adminTxSt=tx_state)
+
+    proposed = dict((k,v) for k, v in args.iteritems() if v is not None)
+
+    delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+
+    new_mo = None
+    if state == 'present':
+        if delta or not existing:
+            config_args = {}
+            for key, value in KEY_MAP.iteritems():
+                config_value = delta.get(key,existing.get(key, None))
+                if config_value:
+                    config_args[value] = config_value
+                if 'name' in config_args.keys():
+                    config_args.pop('name')
+                if 'adminRxSt' in config_args.keys():
+                    config_args.pop('adminRxSt')
+                if 'adminTxSt' in config_args.keys():
+                    config_args.pop('adminTxSt')
+            new_mo = IfPol(infraInfra, name=name,
+                           adminRxSt=rx_state,
+                           adminTxSt=tx_state, **config_args)
+    elif state == 'absent':
+        if existing:
+            new_mo = IfPol(infraInfra, name=name,
+                           adminRxSt=rx_state,
+                           adminTxSt=tx_state)
+            new_mo.delete()
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    if new_mo:
+        xmldoc = toXMLStr(new_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            config_req = ConfigRequest()
+            config_req.addMo(new_mo)
+            moDir.commit(config_req)
+            results['new'] = get_existing(moDir, name)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+
+main()

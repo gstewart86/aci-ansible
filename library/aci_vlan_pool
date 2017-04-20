@@ -1,0 +1,212 @@
+#!/usr/bin/env python
+
+DOCUMENTATION = '''
+---
+
+module: aci_vlan_pool
+short_description: Manage vlan pools in an ACI fabric
+description:
+    - Offers ability to manage vlan pools
+author: Garrett Stewart (garrett.tstewart@gmail.com)
+requirements:
+    - ACI Fabric 1.0(3f)+
+    - Cobra SDK
+options:
+    name:
+        description:
+            - Name of vlan pool
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    descr:
+        description:
+            - description of vlan pool
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    state:
+        description:
+            - Desired state of the pool
+        required: false
+        default: present
+        choices: ['present','absent']
+        aliases: []
+    username:
+        description:
+            - Username used to login to the switch
+        required: true
+        default: 'admin'
+        choices: []
+        aliases: []
+    password:
+        description:
+            - Password used to login to the switch
+        required: true
+        default: 'C1sco12345'
+        choices: []
+        aliases: []
+    protocol:
+        description:
+            - Dictates connection protocol
+        required: false
+        default: https
+        choices: ['http', 'https']
+        aliases: []
+'''
+
+EXAMPLES = '''
+# ensure vlan pool exists
+- aci_vlan_pool:
+    name=ACI-test-vlan-pool
+    host={{ inventory_hostname }}
+    username={{ user }}
+    password={{ pass }}
+
+# ensure vlan pool does not exist on system
+- aci_vlan_pool:
+    name=ACI-test-vlan-pool
+    state=absent
+    host={{ inventory_hostname }}
+    username={{ user }}
+    password={{ pass }}
+
+'''
+
+import socket
+# disable insecure requests warnings in requests
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    from cobra.model.fvns import VlanInstP
+    from cobra.model.infra import Infra
+    from cobra.model.pol import Uni
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+VLAN_INSTP_MAP = {
+    'alloc_mode': 'allocMode',
+    'descr': 'descr',
+    'name': 'name'
+}
+
+
+def get_attributes(keymap, mo):
+    resource = {}
+    if mo:
+        for mine, cobra in keymap.iteritems():
+            value = getattr(mo, cobra)
+            if value:
+                resource[mine] = value
+    return resource
+
+def get_existing(moDir, name, alloc_mode):
+    uri='uni/infra/vlanns-[{0}]-{1}'
+    mo = moDir.lookupByDn(uri.format(name, alloc_mode))
+    return get_attributes(VLAN_INSTP_MAP, mo)
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            alloc_mode=dict(type='str', required=True),
+            descr=dict(type='str'),
+            # Node Settings
+            encap_blocks=dict(type='list'),
+            # APIC Connection Settings
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    descr = module.params['descr']
+    alloc_mode = module.params['alloc_mode']
+
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+    polUni = Uni('')
+    infraInfra =  Infra(polUni)
+
+    existing = get_existing(moDir, name, alloc_mode)
+
+    args = dict(name=name, descr=descr, alloc_mode=alloc_mode)
+
+    proposed = dict((k,v) for k, v in args.iteritems() if v is not None)
+
+    delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+
+    new_mo = None
+
+    if state == 'present':
+        if delta or not existing:
+            config_args = {}
+            for key, value in VLAN_INSTP_MAP.iteritems():
+                config_value = delta.get(key, existing.get(key, None))
+                if config_value:
+                    config_args[value] = config_value
+                if 'name' in config_args.keys():
+                    config_args.pop('name')
+                elif 'allocMode' in config_args.keys():
+                    config_args.pop('allocMode')
+
+                new_mo = VlanInstP(infraInfra, name=name, allocMode=alloc_mode, **config_args)
+
+
+    elif state == 'absent':
+        if existing:
+            new_mo = VlanInstP(infraInfra, name=existing['name'], allocMode=existing['alloc_mode'])
+            new_mo.delete()
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    if new_mo:
+        xmldoc = toXMLStr(new_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            config_req = ConfigRequest()
+            config_req.addMo(new_mo)
+            moDir.commit(config_req)
+            results['new'] = get_existing(moDir, name, alloc_mode)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+main()

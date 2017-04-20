@@ -1,0 +1,251 @@
+#!/usr/bin/env python
+
+DOCUMENTATION = '''
+---
+
+module: aci_encapsulation_block
+short_description: Manage encapsulation blocks in an ACI fabric
+description:
+    - Offers ability to manage encapsulation blocks
+author: Garrett Stewart (garrett.tstewart@gmail.com)
+requirements:
+    - ACI Fabric 1.0(3f)+
+    - Cobra SDK
+
+NOTE: Pool functionality is limited to VLAN names at this time!***
+
+options:
+    name:
+        description:
+            - Name of VLAN/VXLAN/VSAN name
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    frm:
+        description:
+            - Starting VLAN/VXLAN/VSAN ID
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    to:
+        description:
+            - Ending VLAN/VXLAN/VSAN ID
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    alloc_mode:
+        description:
+            - Allocation Mode
+        required: true
+        default: null
+        choices: ['dynamic', 'inherit', 'static']
+        aliases: []
+    state:
+        description:
+            - Desired state of the name
+        required: false
+        default: present
+        choices: ['present','absent']
+        aliases: []
+    username:
+        description:
+            - Username used to login to the switch
+        required: true
+        default: 'admin'
+        choices: []
+        aliases: []
+    password:
+        description:
+            - Password used to login to the switch
+        required: true
+        default: 'C1sco12345'
+        choices: []
+        aliases: []
+    protocol:
+        description:
+            - Dictates connection protocol
+        required: false
+        default: https
+        choices: ['http', 'https']
+        aliases: []
+'''
+
+EXAMPLES = '''
+# ensure encapsulation block vlan 2535 exists within vlan name ACI-test-vlan-name
+- aci_encapsulation_block:
+    name=ACI-test-vlan-name
+    frm='2535'
+    to='2535'
+    host={{ inventory_hostname }}
+    username={{ user }}
+    password={{ pass }}
+
+# ensure encapsulation block vlan 2535 does not exist within vlan name ACI-test-vlan-name
+- aci_encapsulation_block:
+    name=ACI-test-vlan-name
+    state=absent
+    host={{ inventory_hostname }}
+    username={{ user }}
+    password={{ pass }}
+
+'''
+
+import socket
+import re
+# disable insecure requests warnings in requests
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    from cobra.model.fvns import VlanInstP, EncapBlk
+    from cobra.model.infra import Infra
+    from cobra.model.pol import Uni
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+# Use 'frm' instead of 'from' due to Python keyword status of 'from'
+ENCAP_BLK_MAP = {
+    'name' : 'name',
+    'frm' : 'from',
+    'to' : 'to',
+    'alloc_mode': 'allocMode',
+}
+
+def get_attributes(keymap, mo):
+    resource = {}
+    if mo:
+        for mine, cobra in keymap.iteritems():
+            value = getattr(mo, cobra)
+            if value:
+                resource[mine] = value
+    return resource
+
+def get_pool(md, name, alloc_mode):
+    uri='uni/infra/vlanns-[{0}]-{1}'
+    mo = md.lookupByDn(uri.format(name, alloc_mode))
+    return mo
+
+def get_existing_encap_blk(md, name, alloc_mode, frm, to):
+    uri='uni/infra/vlanns-[{0}]-{1}/from-[{2}]-to-[{3}]'
+    mo = md.lookupByDn(uri.format(name, alloc_mode, frm, to))
+    return get_attributes(ENCAP_BLK_MAP, mo)
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            pool_name=dict(type='str', required=True),
+            from_vlan=dict(type='str', required=True),
+            to_vlan=dict(type='str', required=True),
+            alloc_mode=dict(type='str', required=True),
+            # APIC Connection Settings
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    # Get all parameters from Ansible
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+    state = module.params['state'].lower()
+    name = module.params['pool_name']
+    frm = 'vlan-' + module.params['from_vlan']
+    to = 'vlan-' + module.params['to_vlan']
+    alloc_mode = module.params['alloc_mode']
+
+    # ------------ get existing data --------------------
+    # Set access data for the APIC
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    md = MoDirectory(session)
+    md.login()
+    polUni = Uni('')
+    infraInfra = Infra(polUni)
+
+    # Get existing data from APIC for the encap block in question
+    # Then get the pool that block is assigned to in order to grab the name
+    existing = get_existing_encap_blk(md, name, alloc_mode, frm, to)
+    existing_pool = get_pool(md, name, alloc_mode)
+    if not existing_pool:
+        print module.fail_json(msg='Pool does not exist. Please first create the pool.')
+    existing['name'] = existing_pool.name
+
+    args = dict(name=name,
+                frm=frm,
+                to=to,
+                alloc_mode=alloc_mode)
+
+    proposed = dict((k,v) for k, v in args.iteritems() if v is not None)
+
+    delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+
+    new_mo = None
+
+    if state == 'present':
+        if delta or not existing:
+
+            config_args = {}
+            for key, value in proposed.iteritems():
+                config_value = delta.get(key, existing.get(key, None))
+                if config_value:
+                    config_args[key] = config_value
+
+            fvnsVlanInstP = get_pool(md, name, alloc_mode)
+            new_mo = EncapBlk(fvnsVlanInstP,
+                              from_=config_args['frm'],
+                              to=config_args['to'],
+                              allocMode=alloc_mode)
+
+    elif state == 'absent':
+        if existing:
+            fvnsVlanInstP = get_pool(md, name, alloc_mode)
+            new_mo = EncapBlk(fvnsVlanInstP,
+                              from_=config_args['frm'],
+                              to=config_args['to'],
+                              allocMode=alloc_mode)
+            new_mo.delete()
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    if new_mo:
+        xmldoc = toXMLStr(new_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            config_req = ConfigRequest()
+            config_req.addMo(new_mo)
+            md.commit(config_req)
+            results['new'] = get_existing_encap_blk(md, name, alloc_mode, frm, to)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+main()

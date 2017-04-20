@@ -89,6 +89,13 @@ options:
         default: null
         choices: []
         aliases: []
+    phys_domain:
+        description:
+            - desired physical domain or list of physical domains
+        required: false
+        default: null
+        choices: []
+        aliases: []
     vmm_domain:
         description:
             - desired vmm domain or list of vmm domains (VMware only)
@@ -168,11 +175,15 @@ try:
     from cobra.mit.session import LoginSession
     from cobra.mit.request import ConfigRequest
     from cobra.mit.request import DnQuery
-    from cobra.model.fv import AEPg, RsCons, RsProv, RsBd, RsDomAtt
+    from cobra.model.fv import AEPg, RsCons, RsProv, RsBd, RsDomAtt, RsPathAtt
     from cobra.internal.codec.xmlcodec import toXMLStr
 except ImportError as ie:
     HAS_COBRA = False
 
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 def get_existing(moDir, tenant, anp, name):
     existing = {}
@@ -203,13 +214,23 @@ def get_bdomains(moDir, tenant, anp, name):
     return names
 
 
+def get_phys_domains(moDir, tenant, anp, epg):
+    uri = 'uni/tn-{0}/ap-{1}/epg-{2}'
+    dnq = DnQuery(uri.format(tenant, anp, epg))
+    dnq.queryTarget = 'children'
+    dnq.classFilter = 'fvRsDomAtt'
+    dom = moDir.query(dnq)
+    names = [str(each.tDn).split('phys-')[-1] for each in dom if each.tCl=="physDomP"]
+    return names
+
+
 def get_vmm_domains(moDir, tenant, anp, name):
     uri = 'uni/tn-{0}/ap-{1}/epg-{2}'
     dnq = DnQuery(uri.format(tenant, anp, name))
     dnq.queryTarget = 'children'
     dnq.classFilter = 'fvRsDomAtt'
     vmms = moDir.query(dnq)
-    names = [str(each.tDn).split('dom-')[-1] for each in vmms if each]
+    names = [str(each.tDn).split('dom-')[-1] for each in vmms if each.tCl=="vmmDomP"]
     return names
 
 
@@ -236,6 +257,21 @@ def get_contracts(moDir, tenant):
     return cons
 
 
+def get_epg_static_paths(moDir, tenant, anp, name):
+     existing=[]
+     uri = 'uni/tn-{0}/ap-{1}/epg-{2}'
+     dnq = DnQuery(uri.format(tenant, anp, name))
+     dnq.queryTarget = 'children'
+     dnq.classFilter = 'fvRsPathAtt'
+     paths = moDir.query(dnq)
+     for obj in paths:
+         existing.append({'tDn' : obj.tDn,
+                          'encap' : obj.encap,
+                          'instrImedcy' : obj.instrImedcy,
+                          'mode' : obj.mode})
+     return existing
+
+
 def normalize_to_list(data):
     if isinstance(data, str) or isinstance(data, unicode):
         return [data]
@@ -246,16 +282,15 @@ def normalize_to_list(data):
 
 
 def get_existing_objects(moDir, tenant, anp, name):
-
-    consumed_contracts = get_epg_contracts(moDir, tenant, anp, name,
-                                           'fvRsCons')
-    provided_contracts = get_epg_contracts(moDir, tenant, anp, name,
-                                           'fvRsProv')
+    consumed_contracts = get_epg_contracts(moDir, tenant, anp, name,'fvRsCons')
+    provided_contracts = get_epg_contracts(moDir, tenant, anp, name,'fvRsProv')
     bridge_domain = get_bdomains(moDir, tenant, anp, name)
     vmm_domain = get_vmm_domains(moDir, tenant, anp, name)
+    phys_domain = get_phys_domains(moDir, tenant, anp, name)
     objdict = dict(consumed_contracts=consumed_contracts,
                    provided_contracts=provided_contracts,
                    bridge_domain=bridge_domain,
+                   phys_domain=phys_domain,
                    vmm_domain=vmm_domain)
     return objdict
 
@@ -274,15 +309,16 @@ def assemble(existing_objects, existing, moDir, tenant, anp, name):
 
 
 def get_delta_objects(proposed_objects, existing_objects):
-
     delta = {}
     remove = {}
     for object_type, lists in proposed_objects.iteritems():
+        if not lists:
+            continue
         delta[object_type] = existing_objects.get(
             object_type) == proposed_objects.get(object_type)
-        remove[object_type] = list(set(
-            existing_objects.get(object_type)).difference(
-            proposed_objects.get(object_type)))
+        a_set = set(existing_objects.get(object_type))
+        a_difference = a_set.difference(proposed_objects.get(object_type))
+        remove[object_type] = list(a_difference)
     return delta, remove
 
 
@@ -295,11 +331,14 @@ def build_object(object_type, resource_mo, each):
         RsBd(resource_mo, tnFvBDName=each)
     elif object_type == 'vmm_domain':
         RsDomAtt(
-            resource_mo, tDn='uni/vmmp-VMware/dom-{0}'.format(
-                each))
+            resource_mo, tDn='uni/vmmp-VMware/dom-{0}'.format(each))
+    elif object_type == 'phys_domain':
+        RsDomAtt(
+            resource_mo, tDn='uni/phys-{0}'.format(each))
 
 
 def remove_object(object_type, resource_mo, each):
+    obj = None
     if object_type == 'consumed_contracts':
         obj = RsCons(resource_mo, tnVzBrCPName=each)
     elif object_type == 'provided_contracts':
@@ -308,8 +347,10 @@ def remove_object(object_type, resource_mo, each):
         obj = RsBd(resource_mo, tnFvBDName=each)
     elif object_type == 'vmm_domain':
         obj = RsDomAtt(
-               resource_mo, tDn='uni/vmmp-VMware/dom-{0}'.format(
-                each))
+               resource_mo, tDn='uni/vmmp-VMware/dom-{0}'.format(each))
+    elif object_type == 'phys_domain':
+        obj = RsDomAtt(
+            resource_mo, tDn='uni/phys-{0}'.format(each))
     obj.delete()
 
 
@@ -326,6 +367,8 @@ def main():
             provided_contracts=dict(),
             bridge_domain=dict(),
             vmm_domain=dict(),
+            phys_domain=dict(),
+            static_paths=dict(type='list'),
             state=dict(choices=['present', 'absent'], default='present'),
             host=dict(required=True),
             username=dict(type='str', default='admin'),
@@ -354,6 +397,8 @@ def main():
     provided_contracts = normalize_to_list(module.params['provided_contracts'])
     bridge_domain = normalize_to_list(module.params['bridge_domain'])
     vmm_domain = normalize_to_list(module.params['vmm_domain'])
+    phys_domain = normalize_to_list(module.params['phys_domain'])
+    static_paths = normalize_to_list(module.params['static_paths'])
 
     apic = '{0}://{1}/'.format(protocol, host)
 
@@ -361,6 +406,7 @@ def main():
     moDir = MoDirectory(session)
     moDir.login()
 
+    # Check for existing components ---------
     tenant_mo = moDir.lookupByDn('uni/tn-{0}'.format(tenant))
     if not tenant_mo:
         print module.fail_json(msg='tenant needs to be created first')
@@ -378,7 +424,9 @@ def main():
         if each not in existing_tenant_contracts:
             module.fail_json(msg='contract does not exist', contract=each)
 
+    # Get existing epg and compare with proposed epg -----------
     existing = get_existing(moDir, tenant, anp, name)
+    existing_paths = get_epg_static_paths(moDir, tenant, anp, name)
 
     args = dict(descr=descr, prio=prio)
 
@@ -387,16 +435,16 @@ def main():
 
     existing_objects = get_existing_objects(moDir, tenant, anp, name)
 
-    all_existing = assemble(existing_objects, existing, moDir,
-                            tenant, anp, name)
+    all_existing = assemble(existing_objects, existing, moDir, tenant, anp, name)
 
     proposed_objects = dict(consumed_contracts=consumed_contracts,
                             provided_contracts=provided_contracts,
                             bridge_domain=bridge_domain,
-                            vmm_domain=vmm_domain)
+                            vmm_domain=vmm_domain,
+                            phys_domain=phys_domain)
+    paths_delta = [x for x in static_paths if x not in existing_paths]
 
-    delta_objects, remove_objects = get_delta_objects(proposed_objects,
-                                                      existing_objects)
+    delta_objects, remove_objects = get_delta_objects(proposed_objects,existing_objects)
 
     delta_bools = delta_objects.values()
     delta_for_lists = False
@@ -406,20 +454,29 @@ def main():
     resource_mo = None
 
     if state == 'present':
-        if delta or delta_for_lists:
+        if delta or delta_for_lists or paths_delta:
+
             resource_args = {}
             for key, value in proposed.iteritems():
                 config_value = delta.get(key, existing.get(key, None))
                 if config_value:
                     resource_args[key] = config_value
+
             resource_mo = AEPg(anp_mo, name=name, **resource_args)
             for object_type, bool_condition in delta_objects.iteritems():
                 if not bool_condition:
                     for each in proposed_objects.get(object_type):
                         build_object(object_type, resource_mo, each)
+
             for object_type, lists in remove_objects.iteritems():
                 for each in lists:
                     remove_object(object_type, resource_mo, each)
+
+            # Add paths to object
+            paths_objs = []
+            for path in paths_delta:
+              tmp = RsPathAtt(resource_mo, **path)
+              paths_objs.append(tmp)
 
     elif state == 'absent':
         if existing:

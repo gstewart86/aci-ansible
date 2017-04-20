@@ -1,0 +1,170 @@
+#!/usr/bin/python
+
+import socket
+# disable insecure requests warnings in requests
+import requests
+from re import compile
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    from cobra.model.infra import AttEntityP
+    from cobra.model.infra import Infra
+    from cobra.model.infra import RsDomP
+    from cobra.model.pol import Uni
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+KEY_MAP = {
+    'name': 'name',
+    'descr':'descr'
+}
+
+def get_attributes(keymap, mo):
+    resource = {}
+    if mo:
+        for mine, cobra in keymap.iteritems():
+            value = getattr(mo, cobra)
+            if value:
+                resource[mine] = value
+    return resource
+
+def get_aep(moDir, name):
+    mo = moDir.lookupByDn('uni/infra/attentp-{}'.format(name))
+    return get_attributes(KEY_MAP, mo)
+
+def get_dom_p(moDir, name):
+    dom_re = compile("\W+")
+    uri = 'uni/infra/attentp-{}'
+    dom_name = None
+    dom_type = None
+    if name:
+        dq = DnQuery(uri.format(name))
+        dq.queryTarget = 'children'
+        dq.classFilter = 'infraRsDomP'
+        dom_obj = moDir.query(dq)
+
+        if dom_obj:
+            dom_dn = dom_obj[0].tDn
+            dom_name, dom_type = dom_re.split(dom_dn)[-2:]
+    return dict(name=dom_name, dom_type=dom_type)
+
+def get_existing(moDir, name):
+    existing = {}
+    aep = get_aep(moDir, name)
+    if aep:
+        existing.update(aep)
+        existing.update(get_dom_p(moDir, name))
+
+    return existing
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            domain=dict(type='str'),
+            domain_type=dict(choices=['phys', 'l2', 'l3']),
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    dom = module.params['domain']
+    dom_type = module.params['domain_type']
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+    polUni = Uni('')
+    infraInfra = Infra(polUni)
+    existing = get_existing(moDir, name)
+
+    args = dict(name=name, dom=dom, dom_type=dom_type)
+
+    proposed = dict((k,v) for k, v in args.iteritems() if v is not None)
+
+    delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+
+    new_mo = None
+    if state == 'present':
+        if delta or not existing:
+            config_args = {}
+            for key, value in KEY_MAP.iteritems():
+                config_value = delta.get(key, existing.get(key, None))
+                if config_value:
+                    config_args[value] = config_value
+            if 'name' in config_args.keys():
+                config_args.pop('name')
+            new_mo = AttEntityP(infraInfra, name=name, **config_args)
+            if dom and dom_type:
+                if dom_type in ['l2', 'l3']:
+                    dom_full = dom_type + 'dom'
+                    dom_mo = moDir.lookupByDn(
+                        'uni/{}-{}'.format(dom_full, dom)
+                    )
+                else:
+                    dom_mo = moDir.lookupByDn(
+                        'uni/{}-{}'.format(dom_type, dom)
+                    )
+                if not dom_mo:
+                    module.fail_json(msg="Domain not found. Check your"
+                                 + " dom params dom: {} dom_type: {}".format(
+                dom, dom_type))
+                RsDomP(new_mo, tDn=str(dom_mo.dn))
+            else:
+                new_mo = AttEntityP(infraInfra, name=name, **config_args)
+
+    elif state == 'absent':
+        if existing:
+            new_mo = AttEntityP(infraInfra, name=name)
+            new_mo.delete()
+
+    changed = False
+    results = {}
+    xmldoc =''
+    if new_mo:
+        xmldoc = toXMLStr(new_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            config_req = ConfigRequest()
+            config_req.addMo(new_mo)
+            moDir.commit(config_req)
+            results['new'] = get_existing(moDir, name)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+
+from ansible.module_utils.basic import *
+
+main()

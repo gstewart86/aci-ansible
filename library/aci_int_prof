@@ -1,0 +1,100 @@
+#!/usr/bin/python
+
+try:
+    HAS_COBRA = True
+    import cobra.mit.access
+    import cobra.mit.request
+    import cobra.mit.session
+    import cobra.model.infra
+    import cobra.model.pol
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+import socket
+# disable insecure requests warnings in requests
+import requests
+from re import compile
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+def get_existing(moDir, name):
+    existing = {}
+    aep = get_aep(moDir, name)
+    if aep:
+        existing.update(aep)
+        existing.update(get_dom_p(moDir, name))
+
+    return existing
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            tenant=dict(type='str', required=True),
+            scope=dict(choices=['application-profile', 'context',
+                                'global', 'tenant']),
+            prio=dict(choices=['unspecified', 'level1', 'level2', 'level3']),
+            descr=dict(type='str'),
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    dom = module.params['domain']
+    dom_type = module.params['domain_type']
+    apic = '{0}://{1}/'.format(protocol, host)
+
+
+    session = LoginSession(apic, username, password)
+    md = MoDirectory(session)
+    md.login()
+    polUni = Uni('')
+    infraInfra = Infra(polUni)
+    existing = get_existing(md, name)
+
+    # the top level object on which operations will be made
+    polUni = cobra.model.pol.Uni('')
+    infraInfra = cobra.model.infra.Infra(polUni)
+
+    # build the request using cobra syntax
+    infraAccPortP = cobra.model.infra.AccPortP(infraInfra, ownerKey='', name='ah_test1_int_prof', descr='', ownerTag='')
+
+
+    # commit the generated code to APIC
+    print toXMLStr(infraInfra)
+    c = cobra.mit.request.ConfigRequest()
+    c.addMo(infraInfra)
+    md.commit(c)
+
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+
+from ansible.module_utils.basic import *
+
+main()

@@ -172,7 +172,10 @@ EXAMPLES = '''
 
 
 import socket
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 try:
     HAS_COBRA = True
     from cobra.mit.access import MoDirectory

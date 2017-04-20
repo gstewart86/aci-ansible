@@ -16,6 +16,9 @@
 # limitations under the License.
 
 DOCUMENTATION = '''
+#TODO: Deploy ability to manage scope of subnet in bridge domain module
+    #property = fvSubnet
+    #choices = private, public, shared (pub, priv mutually exclusive)
 ---
 
 module: aci_bridge_domain
@@ -56,6 +59,15 @@ options:
     subnet:
         description:
             - name of subnet that is paired to bridge domain
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    subnet:
+        description:
+            - list of subnets attached to the bridge domain
+                Optional parameters include: IP, Scope, Preferred
+                Scope default is 'private'
         required: false
         default: null
         choices: []
@@ -128,6 +140,10 @@ try:
 except ImportError as ie:
     HAS_COBRA = False
 
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 BD_KEY_MAP = {
     'descr': 'descr',
@@ -159,6 +175,21 @@ def get_subnet(moDir, tenant, name, subnet):
                                                                   subnet))
     return get_attributes(SUBNET_KEY_MAP, mo)
 
+def get_bd_subnets(md, tenant, name):
+    existing=[]
+    propFilter = 'and(wcard(fvSubnet.dn, "%s"))' % name
+    list = md.lookupByClass(
+    "fvSubnet",
+    propFilter = propFilter,
+    queryTarget = "subtree",
+    subtree = 'full'
+    )
+    for obj in list:
+        existing.append({'ip' : obj.ip,
+                         'preferred' : obj.name,
+                         'scope' : obj.scope})
+    return existing
+
 
 def get_context(moDir, tenant, name):
     con = moDir.lookupByDn('uni/tn-{0}/BD-{1}/rsctx'.format(tenant,
@@ -175,7 +206,6 @@ def get_existing(moDir, tenant, name, subnet):
             sub = get_subnet(moDir, tenant, name, subnet)
             existing.update(sub)
         existing.update(get_context(moDir, tenant, name))
-
     return existing
 
 
@@ -187,6 +217,7 @@ def main():
             tenant=dict(type='str', required=True),
             context=dict(type='str', required=True),
             subnet=dict(type='str'),
+            subnets=dict(type='list'),
             descr=dict(type='str'),
             state=dict(choices=['present', 'absent'], default='present'),
             host=dict(required=True),
@@ -212,13 +243,16 @@ def main():
     descr = module.params['descr']
     context = module.params['context']
     subnet = module.params['subnet']
+    subnets = module.params['subnets']
 
+    # Build APIC access
     apic = '{0}://{1}/'.format(protocol, host)
 
     session = LoginSession(apic, username, password)
     moDir = MoDirectory(session)
     moDir.login()
 
+    # Look for existing data
     tenant_mo = moDir.lookupByDn('uni/tn-{0}'.format(tenant))
     if not tenant_mo:
         print module.fail_json(msg='tenant needs to be created first')
@@ -228,25 +262,38 @@ def main():
         print module.fail_json(msg='context needs to be created first')
 
     existing = get_existing(moDir, tenant, name, subnet)
+    existing_subnets = get_bd_subnets(moDir, tenant, name)
 
-    args = dict(name=name, descr=descr, subnet=subnet, context=context)
+    # build proposed data
+    args = dict(name=name,
+                descr=descr,
+                subnet=subnet,
+                context=context)
 
     proposed = dict((k, v) for k, v in args.iteritems() if v is not None)
 
+    # diff existing and proposed
     delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+    if subnets:
+        subnets_delta = [x for x in subnets if x not in existing_subnets]
+    else:
+        subnets_delta = None
 
     new_mo = None
     if state == 'present':
-        if delta or not existing:
+        if delta or not existing or subnets_delta:
+
             config_args = {}
             for key, value in BD_KEY_MAP.iteritems():
                 config_value = delta.get(key, existing.get(key, None))
                 if config_value:
                     config_args[value] = config_value
+
             if 'name' in config_args.keys():
                 config_args.pop('name')
             new_mo = BD(tenant_mo, name=name, **config_args)
             config_args.clear()
+
             for key, value in SUBNET_KEY_MAP.iteritems():
                 config_value = delta.get(key, existing.get(key, None))
                 if config_value:
@@ -255,6 +302,13 @@ def main():
                 Subnet(new_mo, **config_args)
             RsCtx(new_mo, tnFvCtxName=delta.get('context',
                                                 existing.get('context')))
+
+            if subnets_delta:
+                subnet_objs = []
+                for item in subnets_delta:
+                  tmp = Subnet(new_mo, ip=item['ip'], scope=item['scope'], preferred=item['preferred'])
+                  subnet_objs.append(tmp)
+
 
     elif state == 'absent':
         if existing:

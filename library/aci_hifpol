@@ -1,0 +1,152 @@
+#!/usr/bin/python
+
+import socket
+# disable insecure requests warnings in requests
+import requests
+from re import compile
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    from cobra.model.fabric import HIfPol
+    from cobra.model.pol import Uni
+    from cobra.model.infra import Infra
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+KEY_MAP = {
+    'name': 'name',
+    'debounce':'linkDebounce',
+    'auto':'autoNeg',
+    'speed':'speed',
+    'descr':'descr'
+}
+
+
+def get_attributes(keymap, mo):
+    resource = {}
+    if mo:
+        for mine, cobra in keymap.iteritems():
+            value = getattr(mo, cobra)
+            if value:
+                resource[mine] = value
+    return resource
+
+
+def get_existing(moDir, name):
+    uri = 'uni/infra/hintfpol-{}'
+    mo = moDir.lookupByDn(uri.format(name))
+    return get_attributes(KEY_MAP,mo)
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            linkDebounce=dict(type='int'),
+            autoNegotiation=dict(choices=['on', 'off'], default='on'),
+            speed=dict(choices=['inherit',
+                                '100M',
+                                '1G',
+                                '10G',
+                                '40G'], default='inherit'),
+            descr=dict(type='str'),
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    debounce = module.params['linkDebounce']
+    if 0 > debounce > 5000:
+        module.fail_json(msg='link debounce value outside+'
+                             ' of vaild range: {}'.format(debounce))
+    auto = module.params['autoNegotiation']
+    speed = module.params['speed']
+    descr = module.params['descr']
+    apic = '{0}://{1}/'.format(protocol, host)
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+    polUni = Uni('')
+    infraInfra = Infra(polUni)
+    existing = get_existing(moDir, name)
+    args = dict(name=name, descr=descr, debounce=debounce, auto=auto, speed=speed)
+
+    proposed = dict((k,v) for k, v in args.iteritems() if v is not None)
+
+    delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+
+    new_mo = None
+    if state == 'present':
+        if delta or not existing:
+            config_args = {}
+            for key, value in KEY_MAP.iteritems():
+                config_value = delta.get(key,existing.get(key, None))
+                if config_value:
+                    config_args[value] = config_value
+                if 'name' in config_args.keys():
+                    config_args.pop('name')
+                if 'speed' in config_args.keys():
+                    config_args.pop('speed')
+                if 'linkDebounce' in config_args.keys():
+                    config_args.pop('linkDebounce')
+                if 'autoNeg' in config_args.keys():
+                    config_args.pop('autoNeg')
+
+            new_mo = HIfPol(infraInfra, name=name,
+                            linkDebounce=debounce,
+                            autoNeg=auto,
+                            speed=speed,
+                            **config_args)
+    elif state == 'absent':
+        if existing:
+            new_mo = HIfPol(infraInfra, name=name,
+                            linkDebounce=debounce,
+                            autoNeg=auto,
+                            speed=speed)
+            new_mo.delete()
+
+    changed = False
+    results = {}
+    xmldoc = toXMLStr(new_mo)
+    if module.check_mode:
+        module.exit_json(changed=True, xmldoc=xmldoc)
+    else:
+        changed = True
+        config_req = ConfigRequest()
+        config_req.addMo(new_mo)
+        moDir.commit(config_req)
+        results['new'] = get_existing(moDir, name)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+
+main()

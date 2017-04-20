@@ -1,0 +1,105 @@
+#!/usr/bin/python
+
+import socket
+
+#disable warnings
+import requests
+requests.packages.urllib3.disable_warnings()
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.access import ClassQuery
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    from cobra.model.fv import AEPg, RsCons, RsProv, RsBd, RsDomAtt
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+def gather_facts(moDir):
+    """
+    collect useful facts about nodes
+    :param moDir:
+    :return dict:
+    """
+    node_facts = {'nodes': {}}
+    #get all of the nodes
+    cq = ClassQuery('fabricNode')
+    nodes = moDir.lookupByClass('fabricNode')
+    #get the source link to the node locations
+    locs = moDir.lookupByClass('geoRsNodeLocation')
+    for node in nodes:
+        #collect all of the useful items from the node
+        node_dict = {node.id:{}}
+        node_dict[node.id].update({'dn':str(node.dn)})
+        node_dict[node.id].update({'fabricSt':node.fabricSt})
+        node_dict[node.id].update({'id':node.id})
+        node_dict[node.id].update({'model':node.model})
+        node_dict[node.id].update({'name':node.name})
+        node_dict[node.id].update({'rn':str(node.rn)})
+        node_dict[node.id].update({'role':node.role})
+        node_dict[node.id].update({'serial':node.serial})
+        node_dict[node.id].update({'status':str(node.status)})
+        node_dict[node.id].update({'uid':node.uid})
+        node_dict[node.id].update({'vendor':node.vendor})
+        node_dict[node.id].update({'version':node.version})
+        for loc in locs:
+            if loc.tDn == str(node.dn):
+                node_dict[node.id].update({'location': str(loc.parentDn)})
+
+        #collect the useful System data
+        dq = DnQuery(str(node.dn)+"/sys")
+        dq.subtree = 'children'
+        dq.subtreeClassFilter = 'l1PhysIf'
+        node_sys = moDir.query(dq)[0]
+        #only check the following items for leaf and spine devices
+        node_dict[node.id].update({'oobMgmtAddr':node_sys.oobMgmtAddr})
+        node_dict[node.id].update({'systemUpTime':node_sys.systemUpTime})
+        int_dict = {"interfaces":{}}
+        ints = node_sys.phys
+        for iface in ints:
+            int_dict["interfaces"].update({iface.id: {}})
+            int_dict["interfaces"][iface.id].update({'adminSt': iface.adminSt})
+            int_dict["interfaces"][iface.id].update({'dn': str(iface.dn)})
+            int_dict["interfaces"][iface.id].update({'id': iface.id})
+            int_dict["interfaces"][iface.id].update({'mode': iface.mode})
+            int_dict["interfaces"][iface.id].update({'usage': iface.usage})
+        node_dict[node.id].update(int_dict)
+        node_facts['nodes'].update(node_dict)
+
+    return node_facts
+
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+
+    facts = {'ansible_facts':{}}
+    node_facts = gather_facts(moDir)
+    facts['ansible_facts'].update(node_facts)
+
+    module.exit_json(**facts)
+
+
+from ansible.module_utils.basic import *
+main()

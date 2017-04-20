@@ -1,0 +1,374 @@
+#!/usr/bin/python
+
+# Copyright 2015 Jason Edelman <jason@networktocode.com>
+# Network to Code, LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+
+module: aci_external_routed_network
+short_description: Manage tenant external routed network(L3outs) in an ACI fabric
+description:
+    - Offers ability to manage tenant external routed networks
+author: Garrett Stewart (garrett.tstewart@gmail.com)
+requirements:
+    - ACI Fabric 1.0(3f)+
+    - Cobra SDK
+options:
+    name:
+        description:
+            - Name of logical node profile
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    descr:
+        description:
+            - description of logical node profile
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    tDn:
+        description:
+            - Distinguished name of the node used in this profile
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    state:
+        description:
+            - Desired state of the tenant
+        required: false
+        default: present
+        choices: ['present','absent']
+        aliases: []
+    host:
+        description:
+            - IP Address or hostname of APIC resolvable by Ansible control host
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    username:
+        description:
+            - Username used to login to the switch
+        required: true
+        default: 'admin'
+        choices: []
+        aliases: []
+    password:
+        description:
+            - Password used to login to the switch
+        required: true
+        default: 'C1sco12345'
+        choices: []
+        aliases: []
+    protocol:
+        description:
+            - Dictates connection protocol
+        required: false
+        default: https
+        choices: ['http', 'https']
+        aliases: []
+'''
+
+EXAMPLES = '''
+# ensure logical node profile exists
+- aci_external_routed_network:
+    tenant=ACILab
+    name=ACI-test-l3out
+    descr='tenant by Ansible'
+    host={{ inventory_hostname }}
+    username={{ user }}
+    password={{ pass }}
+
+# ensure logical node profile does not exist on system
+- aci_external_routed_network:
+    tenant=ACILab
+    name=ACI-test-l3out
+    state=absent
+    host={{ inventory_hostname }}
+    username={{ user }}
+    password={{ pass }}
+
+'''
+
+import socket
+import requests
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    import cobra.model.ospf
+    import cobra.model.l3ext
+    import cobra.model.pol
+    from cobra.model.fv import Tenant
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+requests.packages.urllib3.disable_warnings()
+
+def merge_dicts(*dict_args):
+    '''
+    Given any number of dicts, shallow copy and merge into a new dict,
+    precedence goes to key value pairs in latter dicts.
+    '''
+    result = {}
+    for dictionary in dict_args:
+        result.update(dictionary)
+    return result
+
+def get_existing_params(md, l3out, classes):
+    existing = {}
+    # existing['nodes'] = []
+    propFilter = 'and(wcard(l3extLNodeP.dn, "%s"))' % l3out
+    list = md.lookupByClass(
+        "l3extLNodeP",
+        propFilter = propFilter,
+        queryTarget = "subtree",
+        classFilter = classes
+    )
+    for obj in list:
+        # logical node prof config
+        if hasattr(obj, 'name'):
+            existing['name'] = obj.name
+        if hasattr(obj, 'descr'):
+            existing['descr'] = obj.descr
+        if hasattr(obj, 'targetDscp'):
+            existing['targetDscp'] = obj.targetDscp
+        # node config
+        if hasattr(obj, 'rtrId'):
+            existing['nodes'].append({'rtrid' : obj.rtrId, 'tDn' : obj.tDn})
+            #existing['tDn'] = obj.rtrId
+    return existing
+
+def get_log_node_prof(md, name):
+    existing = {}
+    # Used the object browser at <apicaddr>.visore to find the proper object and output its
+    # last query. That's how i found the string to use as the propFilter argument.
+    # i.e.     /api/node/class/l3extOut.xml?query-target-filter=and(wcard(l3extOut.dn,"test-tenant"))
+    # Build the argument
+    propFilter = 'and(wcard(l3extLNodeP.dn, "%s"))' % name
+    # Returns as some sort of dict. If there are 0 results, will still be an empty dict
+    # So we'll do an if statement to return either a specific object or a NoneType
+    list = md.lookupByClass("l3extLNodeP", propFilter=propFilter)
+    for obj in list:
+        existing['name'] = obj.name
+        existing['descr'] = obj.descr
+        existing['targetDscp'] = obj.targetDscp
+        l3out_obj = md.lookupByDn(str(obj.parentDn))
+        existing['l3out'] = l3out_obj.name
+    return existing
+
+def get_log_node_prof_nodes(md, name):
+    existing=[]
+    propFilter = 'and(wcard(l3extRsNodeL3OutAtt.dn, "%s"))' % name
+    list = md.lookupByClass(
+    "l3extRsNodeL3OutAtt",
+    propFilter = propFilter,
+    queryTarget = "subtree"
+    )
+    for obj in list:
+        existing.append({'rtrId' : obj.rtrId,
+                         'tDn' : obj.tDn,
+                         'rtrIdLoopBack' : obj.rtrIdLoopBack})
+    return existing
+
+def get_tenant_mo(moDir, tenant):
+    existing={}
+    uri = 'uni/tn-{0}/'
+    dnq = DnQuery(uri.format(tenant))
+    dnq.queryTarget = 'self'
+    dnq.classFilter = 'fvTenant'
+    obj = moDir.query(dnq)
+    return obj
+
+def get_l3out_mo(moDir, l3out, tenant=None):
+    existing={}
+    if tenant:
+        propFilter = 'and(wcard(l3extOut.dn, "{0}"))'.format(tenant)
+    else:
+        propFilter = 'and(wcard(l3extOut.dn, "%s"))' % l3out
+    mo = moDir.lookupByClass(
+    "l3extOut",
+    propFilter = propFilter,
+    queryTarget = "self"
+    )
+    if mo.totalCount <= 1:
+        mo = mo[0]
+    return mo
+
+def main():
+
+    config_args = {}
+    vrf_args = {}
+    ospf_args = {}
+    l3out_args = {}
+    changed = False
+    results = {}
+    xmldoc = ''
+    new_mo = None
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            # L3out Settings
+            tenant=dict(type='str', required=True),
+            name=dict(type='str', required=True),
+            l3out=dict(type='str', required=True),
+            descr=dict(type='str'),
+            targetDscp=dict(type='str', default='unspecified'),
+            # Node Settings
+            nodes=dict(type='list'),
+            # APIC Connection Settings
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    # Get all parameters from Ansible
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+    state = module.params['state'].lower()
+    tenant = module.params['tenant']
+    descr = module.params['descr']
+    name = module.params['name']
+    l3out = module.params['l3out']
+    targetDscp = module.params['targetDscp']
+    nodes = module.params['nodes']
+
+    # Passed the assigned values into a dict for ease-of-use
+    args = dict(
+        tenant=tenant,
+        name=name,
+        descr=descr,
+        l3out=l3out,
+        targetDscp=targetDscp,
+    )
+
+    # ---------------- input normalization ------------------------------------
+    # Strip out empty arguments
+    proposed = dict((k, v) for k, v in args.iteritems() if v is not None)
+
+    # Un-translate any 'False' arguments that are passed originally as 'no'
+    for node in nodes:
+        if node['rtrIdLoopBack']:
+            node['rtrIdLoopBack'] = 'yes'
+        else:
+            node['rtrIdLoopBack'] = 'no'
+
+
+    # ------------ get existing data --------------------
+    # Set access data for the APIC
+    apic = '{0}://{1}/'.format(protocol, host)
+    session = LoginSession(apic, username, password)
+    md = MoDirectory(session)
+    md.login()
+
+    # Get existing data from APIC
+    existing = get_existing_params(md, l3out, 'l3extLNodeP')
+    existing_nodes = get_log_node_prof_nodes(md, l3out)
+
+    # ---------------- compare data and params ------------------------------
+    # This part looks for a difference between the arguments that were passed and those that currently exist
+    # Specifically, this phrase says "what does 'proposed' have that 'existing' doesnt?
+    # returns 'delta', a list of things that proposed has that existing doesn't have.
+    # This gives you a list of things that need changin'
+    prof_delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+    nodes_delta = [x for x in nodes if x not in existing_nodes]
+
+    # Logic for defining how to create the new object. First check if we even said we want it there
+    # with 'present' then check if there are any differences or the config doesn't exist yet
+    if state == 'present':
+        if prof_delta or nodes_delta or not summary:
+
+            # Ensure that a proposed value gets configured somehow, whether
+            # It is using a proposed value or an existing value
+            # ignore the fact that its using proposed in the 'for' loop and 'delta' inside -  should be the same
+            for key, value in proposed.iteritems():
+                config_value = prof_delta.get(key, existing.get(key, None))
+                if config_value:
+                    config_args[key] = config_value
+
+            # You have to pass the name argument alone, outside of the kwargs dict.
+            # So we remove that piece and pass it directly
+            # Also, we have to pop and return any configuration that will be created
+            # By a different object than the parent
+            if 'name' in config_args.keys():
+                name = config_args.pop('name')
+
+            if 'l3out' in config_args.keys():
+                l3out = config_args.pop('l3out')
+
+            if 'tenant' in config_args.keys():
+                tenant = config_args.pop('tenant')
+
+
+
+            # -------------------Build the managed objects------------------
+            # Build parent Mo
+            polUni = cobra.model.pol.Uni('')
+            fvTenant = cobra.model.fv.Tenant(polUni, tenant)
+            l3extOut = cobra.model.l3ext.Out(fvTenant, l3out)
+            new_mo = cobra.model.l3ext.LNodeP(l3extOut, name=name, **config_args)
+
+            # TODO: Check for necessary child object configuration, and then create it if present
+            # the i counter is to ensure the objects are created without overwriting one another
+            node_objs = []
+            for node in nodes_delta:
+              tmp = cobra.model.l3ext.RsNodeL3OutAtt(new_mo, **node)
+              node_objs.append(tmp)
+
+
+    elif state == 'absent':
+        if existing:
+            new_mo = cobra.model.l3ext.Out(existing['l3out'], tenant)
+            new_mo.delete()
+
+    if new_mo:
+        xmldoc = toXMLStr(new_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            tenantCfg = ConfigRequest()
+            tenantCfg.addMo(new_mo)
+            md.commit(tenantCfg)
+            results['new'] = get_log_node_prof(md, name)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    #TODO: Figure out why it always reports as changed - likely because of the rtrIdLoopBacj translation
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+main()

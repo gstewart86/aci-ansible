@@ -1,0 +1,167 @@
+#!/usr/bin/env python
+
+import socket
+# disable insecure requests warnings in requests
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    from cobra.model.fvns import EncapBlk
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+ENCAP_BLK_MAP = {
+    'alloc_mode': 'allocMode',
+    'descr': 'descr',
+    'from': 'from',
+    'to': 'to',
+}
+
+
+def get_attributes(keymap, mo):
+    resource = {}
+    if mo:
+        for mine, cobra in keymap.iteritems():
+            value = getattr(mo, cobra)
+            if value:
+                resource[mine] = value
+    return resource
+
+
+def get_existing(moDir, pool_name, alloc_mode, from_vlan, to_vlan):
+    # encap blocks can inherit their allocation mode from their parents.
+    # if we see inherit, try to get both.
+    uri = 'uni/infra/vlanns-[{0}]-{1}/from-[vlan-{2}]-to-[vlan-{3}]'
+    staticp_mo = moDir.lookupByDn(uri.format(pool_name, 'static', from_vlan, to_vlan))
+    dynamicp_mo = moDir.lookupByDn(uri.format(pool_name, 'dynamic', from_vlan, to_vlan))
+    mo = None
+    if staticp_mo:
+        mo = staticp_mo
+    elif dynamicp_mo:
+        mo = dynamicp_mo
+    return get_attributes(ENCAP_BLK_MAP, mo)
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            pool_name=dict(type='str', required=True),
+            from_vlan=dict(type='str', required=True),
+            to_vlan=dict(type='str', required=True),
+            alloc_mode=dict(type='str', required=True),
+            descr=dict(type='str'),
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    pool_name = module.params['pool_name']
+    from_vlan = module.params['from_vlan']
+    to_vlan = module.params['to_vlan']
+    descr = module.params['descr']
+    alloc_mode = module.params['alloc_mode']
+
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+
+    # a encap_blk allocmode might be set to inherit. If it is, try the static and dynamic
+    # allocmodes
+    if alloc_mode == 'inherit':
+        staticp_mo = moDir.lookupByDn('uni/infra/vlanns-[{}]-{}/'.format(pool_name, 'static'))
+        dynamicp_mo = moDir.lookupByDn('uni/infra/vlanns-[{}]-{}/'.format(pool_name, 'dynamic'))
+        if not staticp_mo or dynamicp_mo:
+            print module.fail_json(msg='Vlan Pool needs to be created first.')
+        if staticp_mo:
+            vlan_instp_mo = staticp_mo
+        elif dynamicp_mo:
+            vlan_instp_mo = dynamicp_mo
+    else:
+       vlan_instp_mo = moDir.lookupByDn('uni/infra/vlanns-[{}]-{}/'.format(pool_name, alloc_mode))
+    existing = get_existing(moDir, pool_name, alloc_mode, from_vlan, to_vlan)
+
+    args = dict(descr=descr, alloc_mode=alloc_mode, to=to_vlan)
+    args.update({'from': from_vlan})
+
+    proposed = dict((k, v) for k, v in args.iteritems() if v is not None)
+
+    delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+
+    new_mo = None
+    config_args = {}
+    vlan_str = 'vlan-{}'
+
+    if state == 'present':
+        if delta or not existing:
+            for key, value in ENCAP_BLK_MAP.iteritems():
+                config_value = delta.get(key, existing.get(key, None))
+                if config_value == 'from' or config_value == 'to':
+                    config_args[value] = vlan_str.format(config_value)
+                elif config_value:
+                    config_args[value] = config_value
+            new_mo = EncapBlk(vlan_instp_mo,
+                              from_=vlan_str.format(config_args['from']),
+                              to=vlan_str.format(config_args['to']),
+                              descr=config_args['descr'],
+                              allocMode=config_args['allocMode'])
+
+
+    elif state == 'absent':
+        if existing:
+            new_mo = EncapBlk(vlan_instp_mo,
+                              from_=existing['from'],
+                              to=existing['to'],
+                              allocMode=existing['alloc_mode'])
+            new_mo.delete()
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    if new_mo:
+        xmldoc = toXMLStr(new_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            config_req = ConfigRequest()
+            config_req.addMo(new_mo)
+            moDir.commit(config_req)
+            results['new'] = get_existing(moDir, pool_name, alloc_mode, from_vlan, to_vlan)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+
+from ansible.module_utils.basic import *
+
+main()

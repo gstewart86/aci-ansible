@@ -1,0 +1,167 @@
+#!/usr/bin/python
+
+import socket
+# disable insecure requests warnings in requests
+import requests
+from re import compile
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    from cobra.model.fvns import VlanInstP
+    from cobra.model.infra import Infra
+    from cobra.model.infra import RsVlanNs
+    from cobra.model.phys import DomP
+    from cobra.model.pol import Uni
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+KEY_MAP = {
+    'name': 'name',
+}
+
+
+def get_attributes(keymap, mo):
+    resource = {}
+    if mo:
+        for mine, cobra in keymap.iteritems():
+            value = getattr(mo, cobra)
+            if value:
+                resource[mine] = value
+    return resource
+
+
+def get_phys_dom(moDir, name):
+    mo = moDir.lookupByDn('uni/phys-{}'.format(name))
+    return get_attributes(KEY_MAP, mo)
+
+
+def get_vlan_inst_p(moDir, name):
+    pool_fields = compile("\W+")
+    uri = 'uni/phys-{}'
+    pool = None
+    pool_type = None
+    if name:
+        dq = DnQuery(uri.format(name))
+        dq.queryTarget = 'children'
+        dq.classFilter = 'infraRsVlanNs'
+        pool_obj = moDir.query(dq)
+
+        if pool_obj:
+            pool_dn = pool_obj[0].tDn
+            pool, pool_type = pool_fields.split(pool_dn)[-2:]
+    return dict(pool=pool, pool_type=pool_type)
+
+
+def get_existing(moDir, name):
+    existing = {}
+    phys_dom = get_phys_dom(moDir, name)
+    if phys_dom:
+        existing.update(phys_dom)
+        existing.update(get_vlan_inst_p(moDir, name))
+
+    return existing
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            vlan_pool=dict(type='str'),
+            pool_type=dict(choices=['static', 'dynamic']),
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    pool = module.params['vlan_pool']
+    pool_type = module.params['pool_type']
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+    polUni = Uni('')
+    existing = get_existing(moDir, name)
+
+    args = dict(name=name, pool=pool, pool_type=pool_type)
+
+    proposed = dict((k, v) for k, v in args.iteritems() if v is not None)
+
+    delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+
+    new_mo = None
+    if state == 'present':
+        if delta or not existing:
+            config_args = {}
+            for key, value in KEY_MAP.iteritems():
+                config_value = delta.get(key, existing.get(key, None))
+                if config_value:
+                    config_args[value] = config_value
+            if 'name' in config_args.keys():
+                config_args.pop('name')
+            new_mo = DomP(polUni, name=name, **config_args)
+            if pool and pool_type:
+                pool_mo = moDir.lookupByDn(
+                    'uni/infra/vlanns-[{0}]-{1}'.format(pool, pool_type))
+                if not pool_mo:
+                    module.fail_json(msg="Vlan pool not found. Check your"
+                                         + " pool params Pool: {} Pool_type: {}".format(
+                        pool, pool_type))
+                RsVlanNs(new_mo, tDn=str(pool_mo.dn))
+            else:
+                new_mo = DomP(polUni, name=name, **config_args)
+
+    elif state == 'absent':
+        if existing:
+            new_mo = DomP(polUni, name=name)
+            new_mo.delete()
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    if new_mo:
+        xmldoc = toXMLStr(new_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            config_req = ConfigRequest()
+            config_req.addMo(new_mo)
+            moDir.commit(config_req)
+            results['new'] = get_existing(moDir, name)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+
+from ansible.module_utils.basic import *
+
+main()
