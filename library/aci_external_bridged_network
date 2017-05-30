@@ -1,0 +1,404 @@
+#!/usr/bin/python
+
+# Copyright 2015 Jason Edelman <jason@networktocode.com>
+# Network to Code, LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+
+module: aci_external_bridged_network
+short_description: Manage tenant external bridged network(l2outs) in an ACI fabric
+description:
+    - Offers ability to manage tenant external bridged networks
+author: Garrett Stewart (garrett.tstewart@gmail.com)
+requirements:
+    - ACI Fabric 1.0(3f)+
+    - Cobra SDK
+options:
+    name:
+        description:
+            - Name of l2out
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    descr:
+        description:
+            - description of l2out
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    state:
+        description:
+            - Desired state of the tenant
+        required: false
+        default: present
+        choices: ['present','absent']
+        aliases: []
+    host:
+        description:
+            - IP Address or hostname of APIC resolvable by Ansible control host
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    username:
+        description:
+            - Username used to login to the switch
+        required: true
+        default: 'admin'
+        choices: []
+        aliases: []
+    password:
+        description:
+            - Password used to login to the switch
+        required: true
+        default: 'C1sco12345'
+        choices: []
+        aliases: []
+    protocol:
+        description:
+            - Dictates connection protocol
+        required: false
+        default: https
+        choices: ['http', 'https']
+        aliases: []
+'''
+
+EXAMPLES = '''
+# ensure l2out exists
+- aci_external_bridged_network:
+    tenant=ACILab
+    name=ACI-test-l2out
+    descr='tenant by Ansible'
+    host={{ inventory_hostname }}
+    username={{ user }}
+    password={{ pass }}
+
+# ensure l2out does not exist on system
+- aci_external_bridged_network:
+    tenant=ACILab
+    name=ACI-test-l2out
+    state=absent
+    host={{ inventory_hostname }}
+    username={{ user }}
+    password={{ pass }}
+
+'''
+
+import socket
+import requests
+
+try:
+    HAS_COBRA = True
+    from cobra.mit.access import MoDirectory
+    from cobra.mit.session import LoginSession
+    from cobra.mit.request import ConfigRequest
+    from cobra.mit.request import DnQuery
+    from cobra.model.fv import Tenant
+    from cobra.model import l2ext
+    from cobra.model import pol
+    from cobra.internal.codec.xmlcodec import toXMLStr
+except ImportError as ie:
+    HAS_COBRA = False
+
+requests.packages.urllib3.disable_warnings()
+
+def merge_dicts(*dict_args):
+    '''
+    Given any number of dicts, shallow copy and merge into a new dict,
+    precedence goes to key value pairs in latter dicts.
+    '''
+    result = {}
+    for dictionary in dict_args:
+        result.update(dictionary)
+    return result
+
+def get_l2out(moDir, tenant, name):
+    existing = {}
+    uri = 'uni/tn-{0}/l2out-{1}'
+    mo = moDir.lookupByDn(uri.format(tenant, name))
+    if mo:
+        existing['name'] = mo.name
+        # TODO: Also get the nameAlias property (for whatever reason you would need that)
+        existing['descr'] = mo.descr
+        existing['targetDscp'] = mo.targetDscp
+        tenant_obj = moDir.lookupByDn(str(mo.parentDn))
+        existing['tenant'] = tenant_obj.name
+    return existing
+
+"""
+def get_l2out(md, tenant, l2out):
+    existing = {}
+    # Used the object browser at <apicaddr>.visore to find the proper object and output its
+    # last query. That's how i found the string to use as the propFilter argument.
+    # i.e.     /api/node/class/l2extOut.xml?query-target-filter=and(wcard(l2extOut.dn,"test-tenant"))
+    # Build the argument
+    propFilter = 'and(wcard(l2extOut.dn, "%s"))' % l2out
+    # Returns as some sort of dict. If there are 0 results, will still be an empty dict
+    # So we should do an if statement to return either a specific object or a NoneType
+    moList = md.lookupByClass("l2extOut", propFilter=propFilter)
+    for obj in moList:
+        existing['name'] = obj.name
+        # TODO: Also get the nameAlias property (for whatever reason you would need that)
+        existing['descr'] = obj.descr
+        existing['targetDscp'] = obj.targetDscp
+        tenant_obj = md.lookupByDn(str(obj.parentDn))
+        existing['tenant'] = tenant_obj.name
+    return existing
+"""
+
+def get_bd(md, tenant, name):
+    mo = md.lookupByDn('uni/tn-{0}/BD-{1}'.format(tenant, name))
+    return mo
+
+def get_l2out_ebd(md, tenant, l2out):
+    existing={}
+    uri = 'uni/tn-{0}/l2out-{1}'
+    dnq = DnQuery(uri.format(tenant, l2out))
+    dnq.queryTarget = 'children'
+    dnq.classFilter = 'l2extRsEBd'
+    bdList = md.query(dnq)
+    for obj in bdList:
+        existing['encap'] = obj.encap
+        existing['tnFvBDName'] = obj.tnFvBDName
+    return existing
+
+def get_l2out_tbd(md, tenant, l2out):
+    existing={}
+    uri = 'uni/tn-{0}/l2out-{1}'
+    dnq = DnQuery(uri.format(tenant, l2out))
+    dnq.queryTarget = 'children'
+    dnq.classFilter = 'l2extRsL2DomAtt'
+    bdList = md.query(dnq)
+    for obj in bdList:
+        existing['tDn'] = obj.tDn
+    return existing
+
+def get_l2out_node_prof(md, tenant, l2out):
+    uri = 'uni/tn-{0}/l2out-{1}'
+    dnq = DnQuery(uri.format(tenant, l2out))
+    dnq.queryTarget = 'subtree'
+    dnq.classFilter = 'l2extLNodeP'
+    bdList = md.query(dnq)
+    return bdList
+
+def get_l2out_int_prof(md, tenant, l2out):
+    uri = 'uni/tn-{0}/l2out-{1}'
+    dnq = DnQuery(uri.format(tenant, l2out))
+    dnq.queryTarget = 'subtree'
+    dnq.classFilter = 'l2extLIfP'
+    bdList = md.query(dnq)
+    return bdList
+
+def get_l2out_paths(md, tenant, l2out):
+    existing = []
+    uri = 'uni/tn-{0}/l2out-{1}'
+    dnq = DnQuery(uri.format(tenant, l2out))
+    dnq.queryTarget = 'subtree'
+    dnq.classFilter = 'l2extRsPathL2OutAtt'
+    path_list = md.query(dnq)
+    for obj in path_list:
+        existing.append({
+            'tDn' : obj.tDn
+                        })
+    return existing
+
+def get_tenant_mo(md, tenant):
+    uri = 'uni/tn-{0}/'
+    dnq = DnQuery(uri.format(tenant))
+    dnq.queryTarget = 'self'
+    dnq.classFilter = 'fvTenant'
+    obj = md.query(dnq)
+    return obj
+
+def main():
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    new_mo = None
+
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            # l2out Settings
+            tenant=dict(type='str', required=True),
+            name=dict(type='str', required=True),
+            description=dict(type='str'),
+            targetDscp=dict(type='str', default='unspecified'),
+            static_paths=dict(type='list'),
+            tenant_bridge_domain=dict(type='str', required=True),
+            external_bridge_domain=dict(type='str'),
+            encapsulation=dict(type='str'),
+            # APIC Connection Settings
+            state=dict(choices=['present', 'absent'], default='present'),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+    if not HAS_COBRA:
+        module.fail_json(msg='Ensure you have the ACI Cobra SDK installed',
+                         error=str(ie))
+
+    # Get all parameters from Ansible
+    tenant = module.params['tenant']
+    name = module.params['name']
+    descr = module.params['description']
+    targetDscp = module.params['targetDscp']
+    static_paths = module.params['static_paths']
+    tenant_bridge_domain = module.params['tenant_bridge_domain']
+    external_bridge_domain = module.params['external_bridge_domain']
+    encapsulation = module.params['encapsulation']
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+    state = module.params['state'].lower()
+
+    # Passed the assigned values into a dict for ease-of-use and better comparison with existing names
+    args = dict(tenant=tenant,
+        name=name,
+        descr=descr,
+        targetDscp=targetDscp,
+        tnFvBDName=tenant_bridge_domain,
+        tDn="uni/l2dom-" + external_bridge_domain,
+        encap="vlan-" + encapsulation)
+
+    # This part looks to strip out empty arguments?
+    proposed = dict((k, v) for k, v in args.iteritems() if v is not None)
+
+    # Set access data for the APIC
+    apic = '{0}://{1}/'.format(protocol, host)
+    session = LoginSession(apic, username, password)
+    md = MoDirectory(session)
+    md.login()
+
+    # Check for existing components ---------
+    tenant_mo = md.lookupByDn('uni/tn-{0}'.format(tenant))
+    if not tenant_mo:
+        print module.fail_json(msg='tenant needs to be created first')
+
+    tenant_bridge_domain = get_bd(md, tenant, tenant_bridge_domain)
+    if not tenant_bridge_domain:
+        print module.fail_json(msg='tenant bridge domain needs to be created first')
+
+    # Get existing data from APIC, handle the error if "existing" returns a NoneType instead of dict
+    existing = get_l2out(md, tenant, name)
+    existing_ebd = get_l2out_ebd(md, tenant, name)
+    existing_tbd = get_l2out_tbd(md, tenant, name)
+    existing_paths = get_l2out_paths(md, tenant, name)
+    # Then put them all together for comparison, minus the paths setting
+    summary = merge_dicts(existing, existing_ebd, existing_tbd)
+
+    # ---------------- compare data and params ------------------------------
+    # This part looks for a difference between the arguments that were passed and those that currently exist
+    # Specifically, this phrase says "what does 'proposed' have that 'existing' doesnt?
+    # returns 'delta', a list of things that proposed has that existing doesn't have.
+    # This gives you a list of things that need changin'
+    delta = dict(set(proposed.iteritems()).difference(summary.iteritems()))
+
+    # TODO: Build list of static_paths more granularly such that its not just comparing objects straight across
+    # TODO: This should then allow for path replacement rather than strictly addition or subtraction - "idempotency"
+    paths_delta = [x for x in static_paths if x not in existing_paths]
+
+    # Logic for defining how to create the new object. First check if we even said we want it there
+    # with 'present' then check if there are any differences or the config doesn't exist yet
+    if state == 'present':
+        if delta or paths_delta:
+
+            # Build a dictionary that represents how the configuration should look
+            # essentially overwriting existing values with proposed values
+            config_args = {}
+            for key, value in summary.iteritems():
+                config_value = delta.get(key, summary.get(key, None))
+                if config_value:
+                    config_args[key] = config_value
+
+            # -------------------Build the managed objects------------------
+            # Declare variables to avoid 'refernced before assignment' shenanigans
+            tnFvBDName = None
+            tDn = None
+            encap = None
+
+            # Pop off and store the components used in other managed objects
+            if 'tnFvBDName' in config_args.keys():
+                tnFvBDName = config_args.pop('tnFvBDName')
+
+            if 'tDn' in config_args.keys():
+                tDn = config_args.pop('tDn')
+
+            if 'encap' in config_args.keys():
+                encap = config_args.pop('encap')
+
+            # Build l2out Mo
+            tenant_mo = get_tenant_mo(md, tenant)[0]
+            new_mo = l2ext.Out(tenant_mo, **config_args)
+
+            # build external bd
+            if tnFvBDName or encap:
+                l2extRsEBd = l2ext.RsEBd(new_mo, tnFvBDName=tnFvBDName, encap=encap)
+
+            # build tenant bd
+            if tDn:
+                l2extRsL2DomAtt = l2ext.RsL2DomAtt(new_mo, tDn=tDn)
+
+            # build path config
+            if paths_delta:
+                path_objs=[]
+                l2extLNodeP = l2ext.LNodeP(new_mo, ownerKey='', name='default', descr='',
+                                                       tag='yellow-green', nameAlias='', ownerTag='')
+                l2extLIfP = l2ext.LIfP(l2extLNodeP, ownerKey='', name='default', descr='',
+                                                   tag='yellow-green', nameAlias='', ownerTag='')
+
+                # Iterate through proposed paths and append them to a temp list
+                # The important thing here is just to get them created, and this is a way to
+                # reuse the variable name
+                for path in paths_delta:
+                    l2extRsPathL2OutAtt = l2ext.RsPathL2OutAtt(l2extLIfP,
+                                                                       tDn='topology/pod-1/protpaths-204-403/pathep-[l2_dc_fw_data_vpc_int_pol_grp]',
+                                                                       descr='', targetDscp='unspecified')
+                    path_objs.append("l2extRsPathL2OutAtt")
+
+    elif state == 'absent':
+        if existing:
+            new_mo = l2ext.Out(existing['l2out'], tenant)
+            new_mo.delete()
+
+    if new_mo:
+        xmldoc = toXMLStr(new_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            tenantCfg = ConfigRequest()
+            tenantCfg.addMo(new_mo)
+            md.commit(tenantCfg)
+            results['new'] = get_l2out(md, tenant, name)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+main()
