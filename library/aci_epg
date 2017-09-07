@@ -233,6 +233,24 @@ def get_vmm_domains(moDir, tenant, anp, name):
     names = [str(each.tDn).split('dom-')[-1] for each in vmms if each.tCl=="vmmDomP"]
     return names
 
+def get_external_bridge_domains(moDir, tenant, anp, name):
+    uri = 'uni/tn-{0}/ap-{1}/epg-{2}'
+    dnq = DnQuery(uri.format(tenant, anp, name))
+    dnq.queryTarget = 'children'
+    dnq.classFilter = 'fvRsDomAtt'
+    vmms = moDir.query(dnq)
+    names = [str(each.tDn).split('dom-')[-1] for each in vmms if each.tCl=="l2extDomP"]
+    return names
+
+def get_external_routed_domains(moDir, tenant, anp, name):
+    uri = 'uni/tn-{0}/ap-{1}/epg-{2}'
+    dnq = DnQuery(uri.format(tenant, anp, name))
+    dnq.queryTarget = 'children'
+    dnq.classFilter = 'fvRsDomAtt'
+    vmms = moDir.query(dnq)
+    names = [str(each.tDn).split('dom-')[-1] for each in vmms if each.tCl=="l3extDomP"]
+    return names
+
 
 def query_for_contracts(moDir, tenant):
     uri = 'uni/tn-{0}'
@@ -287,11 +305,15 @@ def get_existing_objects(moDir, tenant, anp, name):
     bridge_domain = get_bdomains(moDir, tenant, anp, name)
     vmm_domain = get_vmm_domains(moDir, tenant, anp, name)
     phys_domain = get_phys_domains(moDir, tenant, anp, name)
+    external_bridge_domain = get_external_bridge_domains(moDir, tenant, anp, name)
+    external_routed_domain = get_external_routed_domains(moDir, tenant, anp, name)
     objdict = dict(consumed_contracts=consumed_contracts,
                    provided_contracts=provided_contracts,
                    bridge_domain=bridge_domain,
                    phys_domain=phys_domain,
-                   vmm_domain=vmm_domain)
+                   vmm_domain=vmm_domain,
+                   external_bridge_domain=external_bridge_domain,
+                   external_routed_domain=external_routed_domain)
     return objdict
 
 
@@ -330,11 +352,13 @@ def build_object(object_type, resource_mo, each):
     elif object_type == 'bridge_domain':
         RsBd(resource_mo, tnFvBDName=each)
     elif object_type == 'vmm_domain':
-        RsDomAtt(
-            resource_mo, tDn='uni/vmmp-VMware/dom-{0}'.format(each))
+        RsDomAtt(resource_mo, tDn='uni/vmmp-VMware/dom-{0}'.format(each))
     elif object_type == 'phys_domain':
-        RsDomAtt(
-            resource_mo, tDn='uni/phys-{0}'.format(each))
+        RsDomAtt(resource_mo, tDn='uni/phys-{0}'.format(each), instrImedcy='immediate', resImedcy='immediate')
+    elif object_type == 'external_routed_domain':
+        RsDomAtt(resource_mo, tDn='uni/l3dom-{0}'.format(each), instrImedcy='immediate', resImedcy='immediate')
+    elif object_type == 'external_bridge_domain':
+        RsDomAtt(resource_mo, tDn='uni/l2dom-{0}'.format(each), instrImedcy='immediate', resImedcy='immediate')
 
 
 def remove_object(object_type, resource_mo, each):
@@ -346,16 +370,20 @@ def remove_object(object_type, resource_mo, each):
     elif object_type == 'bridge_domain':
         obj = RsBd(resource_mo, tnFvBDName=each)
     elif object_type == 'vmm_domain':
-        obj = RsDomAtt(
-               resource_mo, tDn='uni/vmmp-VMware/dom-{0}'.format(each))
+        obj = RsDomAtt(resource_mo, tDn='uni/vmmp-VMware/dom-{0}'.format(each))
     elif object_type == 'phys_domain':
-        obj = RsDomAtt(
-            resource_mo, tDn='uni/phys-{0}'.format(each))
+        obj = RsDomAtt(resource_mo, tDn='uni/phys-{0}'.format(each))
+    elif object_type == 'external_routed_domain':
+        obj = RsDomAtt(resource_mo, tDn='uni/l3dom-{0}'.format(each))
+    elif object_type == 'external_bridge_domain':
+        obj = RsDomAtt(resource_mo, tDn='uni/l2dom-{0}'.format(each))
     obj.delete()
 
 
 def main():
 
+    # TODO: Accept domain argument as a list, allowing phys, VMM, ebd, or erd as argument
+    # TODO: Allow setting of the immediacy parameter per domain
     module = AnsibleModule(
         argument_spec=dict(
             name=dict(type='str', required=True),
@@ -368,6 +396,8 @@ def main():
             bridge_domain=dict(),
             vmm_domain=dict(),
             phys_domain=dict(),
+            external_bridge_domain=dict(),
+            external_routed_domain=dict(),
             static_paths=dict(type='list'),
             state=dict(choices=['present', 'absent'], default='present'),
             host=dict(required=True),
@@ -398,6 +428,8 @@ def main():
     bridge_domain = normalize_to_list(module.params['bridge_domain'])
     vmm_domain = normalize_to_list(module.params['vmm_domain'])
     phys_domain = normalize_to_list(module.params['phys_domain'])
+    external_bridge_domain = normalize_to_list(module.params['external_bridge_domain'])
+    external_routed_domain = normalize_to_list(module.params['external_routed_domain'])
     static_paths = normalize_to_list(module.params['static_paths'])
 
     apic = '{0}://{1}/'.format(protocol, host)
@@ -441,7 +473,9 @@ def main():
                             provided_contracts=provided_contracts,
                             bridge_domain=bridge_domain,
                             vmm_domain=vmm_domain,
-                            phys_domain=phys_domain)
+                            phys_domain=phys_domain,
+                            external_bridge_domain=external_bridge_domain,
+                            external_routed_domain=external_routed_domain)
     paths_delta = [x for x in static_paths if x not in existing_paths]
 
     delta_objects, remove_objects = get_delta_objects(proposed_objects,existing_objects)

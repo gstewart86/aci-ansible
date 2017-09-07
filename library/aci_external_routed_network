@@ -197,7 +197,6 @@ def get_l3out_vrf(moDir, tenant, l3out):
     return existing
 
 def get_tenant_mo(moDir, tenant):
-    existing={}
     uri = 'uni/tn-{0}/'
     dnq = DnQuery(uri.format(tenant))
     dnq.queryTarget = 'self'

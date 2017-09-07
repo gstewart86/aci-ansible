@@ -147,7 +147,13 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 BD_KEY_MAP = {
     'descr': 'descr',
-    'name': 'name'
+    'name': 'name',
+    'unkMcastAct': 'unkMcastAct',    #flood or
+    'unkMacUcastAct': 'unkMacUcastAct',   #flood or proxy
+    'unicastRoute' : 'unicastRoute',      # yes or
+    'multiDstPktAct' : 'multiDstPktAct',  # bd-flood or
+    'arpFlood': 'arpFlood',         # yes or no
+    'limitIpLearnToSubnets': 'limitIpLearnToSubnets'   # no or
 }
 SUBNET_KEY_MAP = {
     'subnet': 'ip'
@@ -219,6 +225,12 @@ def main():
             subnet=dict(type='str'),
             subnets=dict(type='list'),
             descr=dict(type='str'),
+            l3_unknown_mcast_flood=dict(choices=['flood', 'opt-flood'], default='flood'),  #L3 Unknown Multicast Flooding
+            l2_unknown_unicast=dict(choices=['flood', 'proxy'], default='proxy'), #L2 Unknown Unicast
+            unicastRouting=dict(choices=['yes', 'no'], default='yes'),# L3 Configurations/Unicast Routing
+            multi_dest_flood=dict(choices=['bd-flood', 'encap-flood', 'drop'], default='bd-flood'),#Multi Destination Flooding
+            arpFlood=dict(choices=['yes', 'no'], default='no'),
+            limitIpLearnToSubnets=dict(choices=['yes', 'no'], default='no'),
             state=dict(choices=['present', 'absent'], default='present'),
             host=dict(required=True),
             username=dict(type='str', default='admin'),
@@ -244,6 +256,12 @@ def main():
     context = module.params['context']
     subnet = module.params['subnet']
     subnets = module.params['subnets']
+    unkMcastAct = module.params['l3_unknown_mcast_flood']  # L3 Unknown Multicast Flooding
+    unkMacUcastAct = module.params['l2_unknown_unicast'] # L2 Unknown Unicast
+    unicastRoute = module.params['unicastRouting']  # L3 Configurations/Unicast Routing
+    multiDstPktAct = module.params['multi_dest_flood'] # Multi Destination Flooding
+    arpFlood = module.params['arpFlood']
+    limitIpLearnToSubnets = module.params['limitIpLearnToSubnets']
 
     # Build APIC access
     apic = '{0}://{1}/'.format(protocol, host)
@@ -268,7 +286,14 @@ def main():
     args = dict(name=name,
                 descr=descr,
                 subnet=subnet,
-                context=context)
+                context=context,
+                unkMcastAct=unkMcastAct,  # L3 Unknown Multicast Flooding
+                unkMacUcastAct = unkMacUcastAct,  # L2 Unknown Unicast
+                unicastRoute = unicastRoute,  # L3 Configurations/Unicast Routing
+                multiDstPktAct = multiDstPktAct,  # Multi Destination Flooding
+                arpFlood = arpFlood,
+                limitIpLearnToSubnets =limitIpLearnToSubnets
+    )
 
     proposed = dict((k, v) for k, v in args.iteritems() if v is not None)
 

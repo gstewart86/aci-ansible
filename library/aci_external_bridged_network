@@ -295,8 +295,8 @@ def main():
     if not tenant_mo:
         print module.fail_json(msg='tenant needs to be created first')
 
-    tenant_bridge_domain = get_bd(md, tenant, tenant_bridge_domain)
-    if not tenant_bridge_domain:
+    t_bd = get_bd(md, tenant, tenant_bridge_domain)
+    if not t_bd:
         print module.fail_json(msg='tenant bridge domain needs to be created first')
 
     # Get existing data from APIC, handle the error if "existing" returns a NoneType instead of dict
@@ -326,13 +326,13 @@ def main():
             # Build a dictionary that represents how the configuration should look
             # essentially overwriting existing values with proposed values
             config_args = {}
-            for key, value in summary.iteritems():
+            for key, value in proposed.iteritems():
                 config_value = delta.get(key, summary.get(key, None))
                 if config_value:
                     config_args[key] = config_value
 
             # -------------------Build the managed objects------------------
-            # Declare variables to avoid 'refernced before assignment' shenanigans
+            # Declare variables to avoid 'referenced before assignment' shenanigans
             tnFvBDName = None
             tDn = None
             encap = None
@@ -372,9 +372,10 @@ def main():
                 # reuse the variable name
                 for path in paths_delta:
                     l2extRsPathL2OutAtt = l2ext.RsPathL2OutAtt(l2extLIfP,
-                                                                       tDn='topology/pod-1/protpaths-204-403/pathep-[l2_dc_fw_data_vpc_int_pol_grp]',
-                                                                       descr='', targetDscp='unspecified')
-                    path_objs.append("l2extRsPathL2OutAtt")
+                                                                       tDn=path['tDn'],
+                                                                       descr='',
+                                                                       targetDscp='unspecified')
+                    path_objs.append(l2extRsPathL2OutAtt)
 
     elif state == 'absent':
         if existing:
